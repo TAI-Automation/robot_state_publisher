@@ -182,7 +182,7 @@ void RobotStatePublisher::setupURDF(const std::string & urdf_xml)
   urdf::Model model;
   KDL::Tree tree = parseURDF(urdf_xml, model);
 
-  // Initialize the mimic map
+  // Initialize the mimic & linkage map
   mimic_.clear();
   for (const std::pair<const std::string, urdf::JointSharedPtr> & i : model.joints_) {
     if (i.second->mimic) {
@@ -194,7 +194,11 @@ void RobotStatePublisher::setupURDF(const std::string & urdf_xml)
       jm->joint_name = i.second->mimic->joint_name;
       mimic_[i.first] = jm;
     }
+    if (i.second->linkage) {
+      linkage_.insert(std::make_pair(i.first, i.second->linkage));
+    }
   }
+
 
   KDL::SegmentMap segments_map = tree.getSegments();
   for (const std::pair<const std::string, KDL::TreeElement> & segment : segments_map) {
@@ -295,6 +299,23 @@ void RobotStatePublisher::publishFixedTransforms()
   static_tf_broadcaster_->sendTransform(tf_transforms);
 }
 
+double RobotStatePublisher::compute_linkage(const double crank, const urdf::JointLinkageSharedPtr jl) 
+{
+
+  double base_width = jl->base_width;
+  double leg_length = jl->leg_length;
+  double top_width = jl->top_width;
+
+  double crank_angle = -crank+M_PI_2;
+  double diag_length = sqrt(pow(base_width,2.0)+ pow(leg_length,2.0) -2*leg_length*base_width*cos(crank_angle));
+  double psi = asin(sin(crank_angle)/diag_length*base_width);
+  double phi = acos((pow(top_width,2)+pow(diag_length,2)-pow(leg_length,2))/(2*top_width*diag_length)); 
+  double gamma = psi+phi;
+
+  return M_PI_2-gamma;
+
+}
+
 void RobotStatePublisher::callbackJointState(
   const sensor_msgs::msg::JointState::ConstSharedPtr state)
 {
@@ -334,11 +355,35 @@ void RobotStatePublisher::callbackJointState(
   std::chrono::milliseconds publish_interval_ms =
     std::chrono::milliseconds(static_cast<uint64_t>(1000.0 / publish_freq));
   rclcpp::Time max_publish_time = last_published + rclcpp::Duration(publish_interval_ms);
+
+  std::map<std::string, double> joint_positions;
+
+  // check if a linkage joint that is in the linkage map  
+  for (const std::pair<const std::string, urdf::JointLinkageSharedPtr> & linkage : linkage_){
+    if (std::find(state->name.begin(), state->name.end(), linkage.first) != state->name.end()){
+      RCLCPP_DEBUG(get_logger(), "The linkage joint is in the joint message");
+
+    }
+    else{
+      RCLCPP_DEBUG(get_logger(), "The linkage joint is not in the joint message");
+      // Try to find the crank angle in the joint message
+      auto it = std::find(state->name.begin(), state->name.end(), linkage.second->parent_name);
+      if (it != state->name.end()) {
+        int index = it - state->name.begin();
+        double crank = state->position.at(index);
+        double computed_angle = compute_linkage(crank, linkage.second);
+        RCLCPP_DEBUG(get_logger(), "Adding the linkage joint to the list of joint positions.");
+
+        joint_positions.insert(std::make_pair(linkage.first, computed_angle));
+      }
+
+    }
+  }
+
   if (get_parameter("ignore_timestamp").get_value<bool>() ||
     current_time.nanoseconds() >= max_publish_time.nanoseconds())
   {
     // get joint positions from state message
-    std::map<std::string, double> joint_positions;
     for (size_t i = 0; i < state->name.size(); i++) {
       joint_positions.insert(std::make_pair(state->name[i], state->position[i]));
     }

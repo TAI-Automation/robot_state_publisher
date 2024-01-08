@@ -48,7 +48,7 @@
 #include "urdf/model.h"
 
 using MimicMap = std::map<std::string, urdf::JointMimicSharedPtr>;
-
+using LinkageMap = std::map<std::string, urdf::JointLinkageSharedPtr>;
 namespace robot_state_publisher
 {
 
@@ -112,6 +112,16 @@ protected:
   /// Publish fixed transforms at startup time to /tf2_static.
   void publishFixedTransforms();
 
+  /// Gets used to parse linkage joints (not mimic)
+  /**
+   * @brief 
+   * 
+   * @param crank 
+   * @param jm 
+   * @return double 
+   */
+  double compute_linkage(const double crank, const urdf::JointLinkageSharedPtr jl);
+
   /// The callback that is called when a new JointState message is received.
   /**
    * This method examines the incoming JointStates and applies a series of checks to
@@ -165,6 +175,8 @@ protected:
 
   /// A map of the mimic joints that should be published
   MimicMap mimic_;
+  /// A map of linkage joints that need to be handled.
+  LinkageMap linkage_;
 
   /// The parameter event callback that will be called when a parameter is changed
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
