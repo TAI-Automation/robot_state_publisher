@@ -84,7 +84,7 @@ RobotStatePublisher::RobotStatePublisher(const rclcpp::NodeOptions & options)
   }
 
   // set publish frequency
-  double publish_freq = this->declare_parameter("publish_frequency", 20.0);
+  double publish_freq = this->declare_parameter("publish_frequency", 100.0);
   if (publish_freq < 0.0 || publish_freq > 1000.0) {
     throw std::runtime_error("publish_frequency must be between 0 and 1000");
   }
@@ -165,6 +165,9 @@ void RobotStatePublisher::setupURDF(const std::string & urdf_xml)
     }
     if (i.second->linkage) {
       linkage_.insert(std::make_pair(i.first, i.second->linkage));
+    }
+    if (i.second->linkage_new) {
+      linkage_new_map_.insert(std::make_pair(i.first, i.second->linkage_new));
     }
   }
 
@@ -287,8 +290,210 @@ double RobotStatePublisher::compute_linkage(const double crank, const urdf::Join
 
 }
 
-void RobotStatePublisher::callbackJointState(
-  const sensor_msgs::msg::JointState::ConstSharedPtr state)
+std::set<std::string> RobotStatePublisher::extract_identifiers(const std::string& s)
+{
+  auto is_id_start = [](char ch) {
+    const unsigned char u = static_cast<unsigned char>(ch);
+    return std::isalpha(u) || ch == '_';
+  };
+  auto is_id_char = [](char ch) {
+    const unsigned char u = static_cast<unsigned char>(ch);
+    return std::isalnum(u) || ch == '_';
+  };
+
+  std::set<std::string> ids;
+  for (std::size_t i = 0; i < s.size();)
+  {
+    if (is_id_start(s[i]))
+    {
+      std::size_t j = i + 1;
+      while (j < s.size() && is_id_char(s[j])) ++j;
+      ids.insert(s.substr(i, j - i));
+      i = j;
+    }
+    else
+    {
+      ++i;
+    }
+  }
+
+  // Filter out common constants/functions so they aren't treated as variables.
+  static const std::set<std::string> reserved = {
+    "pi","e",
+    "sin","cos","tan","asin","acos","atan","atan2",
+    "sinh","cosh","tanh","log","log10","ln","exp","sqrt",
+    "abs","min","max","pow","floor","ceil","round",
+    "if","and","or","not","xor","true","false"
+  };
+
+  for (auto it = ids.begin(); it != ids.end(); )
+  {
+    if (reserved.count(*it)) it = ids.erase(it);
+    else ++it;
+  }
+
+  return ids;
+}
+
+std::string RobotStatePublisher::normalize_params(std::string p)
+{
+  // Turns "ab=10 bc=20 cd=30" into "ab:=10,bc:=20,cd:=30"
+  // - ExprTk assignment operator is ':='
+  // - We replace whitespace between assignments with ';' (statement separator)
+
+  // 1) Convert '=' to ':=' (but don't touch '==', '>=', '<=', '!=')
+  for (std::size_t i = 0; i < p.size(); ++i)
+  {
+    if (p[i] == '=')
+    {
+      const bool next_is_eq = (i + 1 < p.size() && p[i + 1] == '=');
+      const bool prev_is_comp = (i > 0 && (p[i - 1] == '<' || p[i - 1] == '>' || p[i - 1] == '!'));
+      if (next_is_eq || prev_is_comp) // comparison, leave it
+          continue;
+
+      p.insert(i, ":"); // '=' becomes ':='
+      ++i;
+    }
+  }
+
+  // 2) Replace whitespace runs with ';' (statement separators)
+  std::string out;
+  out.reserve(p.size() + 8);
+
+  bool in_ws = false;
+  for (char ch : p)
+  {
+    const unsigned char u = static_cast<unsigned char>(ch);
+    const bool ws = (std::isspace(u) != 0);
+
+    if (ws)
+    {
+      in_ws = true;
+      continue;
+    }
+
+    if (in_ws)
+    {
+      if (!out.empty())
+      {
+        char last = out.back();
+        if (last != ';')
+          out.push_back(';');
+      }
+      in_ws = false;
+    }
+
+    out.push_back(ch);
+  }
+
+  while (!out.empty() && (out.back() == ';'))
+      out.pop_back();
+
+  return out;
+}
+
+std::string RobotStatePublisher::exprtk_error_report(const exprtk::parser<double>& parser,
+                                                const std::string& expr)
+{
+  std::ostringstream oss;
+  const std::size_t n = parser.error_count();
+  for (std::size_t i = 0; i < n; ++i)
+  {
+    const auto& err = parser.get_error(i);
+    oss << "error[" << i << "] pos=" << err.token.position
+        << " type=" << exprtk::parser_error::to_str(err.mode)
+        << " token='" << err.token.value << "'";
+    if (err.token.position < expr.size())
+        oss << " context='" << expr.substr(err.token.position, 32) << "'";
+    if (i + 1 < n)
+        oss << " | ";
+  }
+  return oss.str();
+}
+
+double RobotStatePublisher::eval_exprtk_cached(
+  const std::string& cache_key,
+  const std::string& function_str,
+  const std::string& params_str,
+  double input_value,
+  const std::string& input_name)
+{
+  ExprtkCache* cache = nullptr;
+  auto it = exprtk_cache_.find(cache_key);
+  if (it == exprtk_cache_.end() || !it->second ||
+    !it->second->initialized ||
+    it->second->function_str != function_str ||
+    it->second->params_str != params_str)
+  {
+    auto fresh = std::make_unique<ExprtkCache>();
+    fresh->function_str = function_str;
+    fresh->params_str = params_str;
+
+    // Use std::map to keep stable references for symbol_table variables
+    std::set<std::string> ids = extract_identifiers(function_str);
+    {
+      std::set<std::string> pids = extract_identifiers(params_str);
+      ids.insert(pids.begin(), pids.end());
+    }
+
+    for (const auto& id : ids)
+    {
+      fresh->vars[id] = 0.0;
+      fresh->symbol_table.add_variable(id, fresh->vars[id]);
+    }
+    fresh->symbol_table.add_constants();
+
+    // 1) Compile+run params assignments once
+    fresh->params_expr.register_symbol_table(fresh->symbol_table);
+    const std::string norm = normalize_params(params_str);
+    if (!norm.empty())
+    {
+      if (!fresh->parser.compile(norm, fresh->params_expr))
+      {
+        const std::string report = exprtk_error_report(fresh->parser, norm);
+        throw std::runtime_error("ExprTk param parse/compile error: " + report);
+      }
+      (void)fresh->params_expr.value(); // execute assignments
+    }
+
+    // 2) Compile main function expression
+    fresh->func_expr.register_symbol_table(fresh->symbol_table);
+    if (!fresh->parser.compile(function_str, fresh->func_expr))
+    {
+      const std::string report = exprtk_error_report(fresh->parser, function_str);
+      throw std::runtime_error("ExprTk function parse/compile error: " + report);
+    }
+
+    if (fresh->vars.count("c") > 0) {
+      fresh->input_name = "c";
+    } else if (fresh->vars.count("crank") > 0) {
+      fresh->input_name = "crank";
+    }
+
+    fresh->initialized = true;
+    exprtk_cache_[cache_key] = std::move(fresh);
+    cache = exprtk_cache_[cache_key].get();
+  }
+  else
+  {
+    cache = it->second.get();
+  }
+
+  std::string name = input_name;
+  if (name.empty() || cache->vars.count(name) == 0) {
+    name = cache->input_name;
+  }
+  if (!name.empty()) {
+    auto var_it = cache->vars.find(name);
+    if (var_it != cache->vars.end()) {
+      var_it->second = input_value;
+    }
+  }
+
+  return cache->func_expr.value();
+}
+
+void RobotStatePublisher::callbackJointState(const sensor_msgs::msg::JointState::ConstSharedPtr state)
 {
   if (state->name.size() != state->position.size()) {
     if (state->position.empty()) {
@@ -344,6 +549,29 @@ void RobotStatePublisher::callbackJointState(
         double crank = state->position.at(index);
         double computed_angle = compute_linkage(crank, linkage.second);
         RCLCPP_DEBUG(get_logger(), "Adding the linkage joint to the list of joint positions.");
+        RCLCPP_INFO_STREAM(get_logger(), "COMPUTED ANGLE: " << computed_angle);
+
+        joint_positions.insert(std::make_pair(linkage.first, computed_angle));
+      }
+
+    }
+  }
+
+  for (const std::pair<const std::string, urdf::JointLinkageNewSharedPtr> & linkage : linkage_new_map_){
+    if (std::find(state->name.begin(), state->name.end(), linkage.first) != state->name.end()){
+      RCLCPP_DEBUG(get_logger(), "The New linkage joint is in the joint message");
+
+    }
+    else{
+      RCLCPP_DEBUG(get_logger(), "The New linkage joint is not in the joint message");
+      // Try to find the crank angle in the joint message
+      auto it = std::find(state->name.begin(), state->name.end(), linkage.second->parent_name);
+      if (it != state->name.end()) {
+        int index = it - state->name.begin();
+        double crank = state->position.at(index);
+        double computed_angle = eval_exprtk_cached(
+          linkage.first, linkage.second->function_str, linkage.second->params_str, crank, "c");
+        RCLCPP_INFO_STREAM(get_logger(), "COMPUTED ANGLE: " << computed_angle);
 
         joint_positions.insert(std::make_pair(linkage.first, computed_angle));
       }

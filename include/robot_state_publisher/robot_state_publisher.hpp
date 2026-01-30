@@ -47,8 +47,11 @@
 #include "tf2_ros/transform_broadcaster.hpp"
 #include "urdf/model.hpp"
 
+#include "exprtk/exprtk.hpp"
+
 using MimicMap = std::map<std::string, urdf::JointMimicSharedPtr>;
 using LinkageMap = std::map<std::string, urdf::JointLinkageSharedPtr>;
+using LinkageNewMap = std::map<std::string, urdf::JointLinkageNewSharedPtr>;
 namespace robot_state_publisher
 {
 
@@ -122,6 +125,16 @@ protected:
    */
   double compute_linkage(const double crank, const urdf::JointLinkageSharedPtr jl);
 
+  std::set<std::string> extract_identifiers(const std::string& s);
+  std::string normalize_params(std::string p);  
+  std::string exprtk_error_report(const exprtk::parser<double>& parser, const std::string& exprx);
+  double eval_exprtk_cached(
+    const std::string& cache_key,
+    const std::string& function_str,
+    const std::string& params_str,
+    double input_value,
+    const std::string& input_name = std::string());
+
   /// The callback that is called when a new JointState message is received.
   /**
    * This method examines the incoming JointStates and applies a series of checks to
@@ -177,6 +190,25 @@ protected:
   MimicMap mimic_;
   /// A map of linkage joints that need to be handled.
   LinkageMap linkage_;
+  LinkageNewMap linkage_new_map_;
+
+  struct ExprtkCache
+  {
+    using symbol_table_t = exprtk::symbol_table<double>;
+    using expression_t   = exprtk::expression<double>;
+    using parser_t       = exprtk::parser<double>;
+
+    std::map<std::string, double> vars;
+    symbol_table_t symbol_table;
+    expression_t params_expr;
+    expression_t func_expr;
+    parser_t parser;
+    bool initialized{false};
+    std::string function_str;
+    std::string params_str;
+    std::string input_name;
+  };
+  std::map<std::string, std::unique_ptr<ExprtkCache>> exprtk_cache_;
 
   /// The parameter event callback that will be called when a parameter is changed
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
